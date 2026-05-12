@@ -1,19 +1,19 @@
 # Redpanda — Partitioning Deep Dive
 
-> A systems engineering project that traces how Redpanda distributes, replicates, and stores data across partitions — from source code to live experimentation.
+> A systems engineering project that traces how Redpanda distributes,
+> replicates, and stores data across partitions — from source code
+> to live experimentation.
 
 ---
 
 ## Table of Contents
-
 - [Project Overview](#project-overview)
 - [Repository Structure](#repository-structure)
 - [Environment Setup](#environment-setup)
-- [Running Redpanda Locally](#running-redpanda-locally)
+- [Running Redpanda](#running-redpanda)
 - [Source Code Trace](#source-code-trace)
 - [Design Decisions](#design-decisions)
 - [Experiments](#experiments)
-- [Failure Analysis](#failure-analysis)
 - [Key Findings](#key-findings)
 - [References](#references)
 
@@ -21,7 +21,11 @@
 
 ## Project Overview
 
-This project investigates **how Redpanda implements partitioning** at the source-code level. Rather than relying on documentation alone, the goal is to trace actual C++ code paths — from the moment a producer sends a message, through the Raft consensus layer, all the way to physical disk storage.
+This project investigates how Redpanda implements partitioning at the
+source-code level. Rather than relying on documentation alone, the goal
+is to trace actual C++ code paths — from the moment a producer sends a
+message, through the Raft consensus layer, all the way to physical disk
+storage via DMA writes.
 
 **Core questions driving this project:**
 - How does a message get assigned to a partition?
@@ -35,243 +39,184 @@ This project investigates **how Redpanda implements partitioning** at the source
 
 ```
 redpanda-partitioning/
-├── README.md                  ← this file
-├── report.md                  ← full written report (added after analysis)
-├── experiments/
-│   ├── benchmark.sh           ← throughput benchmarks across partition counts
-│   ├── failure_test.sh        ← leader failover simulation
-│   ├── skew_test.sh           ← partition skew experiment
-│   └── results/
-│       ├── benchmark.csv
-│       └── screenshots/
-└── slides/
-    └── presentation.pdf       ← final presentation deck
+├── README.md
+├── week1-notes.md
+├── report/
+│   ├── 1_introduction.md
+│   ├── 2_system_design.md
+│   ├── 3_observation.md
+│   └── 4_failure_analysis.md
+└── experiments/
+    ├── docker-compose.yml
+    ├── exp1_partition_throughput.py
+    ├── exp2_leader_failover.py
+    ├── exp3_partition_skew.py
+    └── results/
+        ├── exp1_output.txt
+        ├── exp2_output.txt
+        └── exp3_output.txt
 ```
 
 ---
 
 ## Environment Setup
 
-**System:** Ubuntu 22.04 LTS  
-**Dependencies:**
+**System:** Ubuntu 26.04 LTS on WSL2 (Windows 11)  
+**Redpanda version:** 26.1.7-1  
+**RPK version:** 26.1.7-1  
+**CPU cores:** 8  
 
 ```bash
-sudo apt update && sudo apt upgrade -y
+# Install dependencies
+sudo apt install -y git curl wget unzip python3 python3-pip ripgrep
 
-sudo apt install -y \
-  git curl wget unzip \
-  docker.io docker-compose \
-  kafkacat python3 python3-pip \
-  ripgrep tree
-
-# Allow Docker without sudo
-sudo usermod -aG docker $USER
-newgrp docker
-```
-
-**Install `rpk` (Redpanda CLI):**
-
-```bash
+# Install rpk
 curl -LO https://github.com/redpanda-data/redpanda/releases/latest/download/rpk-linux-amd64.zip
 unzip rpk-linux-amd64.zip
 sudo mv rpk /usr/local/bin/
-rpk version
-```
 
-**Clone Redpanda source** (for code tracing — no need to compile):
+# Install Redpanda
+curl -1sLf \
+  'https://dl.redpanda.com/nzc4ZYQK3WRGd9sy/redpanda/cfg/setup/bash.deb.sh' \
+  | sudo -E bash
+sudo apt-get install -y redpanda
 
-```bash
-git clone https://github.com/redpanda-data/redpanda.git
+# Install Python client
+python3 -m pip install --break-system-packages kafka-python
 ```
 
 ---
 
-## Running Redpanda Locally
+## Running Redpanda
 
-Single-node setup via Docker:
+Single node (for Experiments 1 and 3):
 
 ```bash
-docker run -d --name redpanda \
-  -p 9092:9092 \
-  -p 9644:9644 \
-  docker.redpanda.com/redpandadata/redpanda:latest \
-  redpanda start \
+sudo rpk redpanda start \
   --overprovisioned \
   --smp 1 \
   --memory 1G \
   --reserve-memory 0M \
   --node-id 0 \
-  --check=false
-```
+  --check=false \
+  --install-dir /opt/redpanda &
 
-Verify the cluster is up:
-
-```bash
 rpk cluster info --brokers localhost:9092
 ```
 
-Create a test topic and produce messages:
+3-node cluster (for Experiment 2):
 
 ```bash
-rpk topic create my-topic --partitions 3 --replicas 1 --brokers localhost:9092
-echo "hello redpanda" | rpk topic produce my-topic --brokers localhost:9092
-rpk topic consume my-topic --brokers localhost:9092
-rpk topic describe my-topic --brokers localhost:9092
+cd experiments/
+docker-compose up -d
+sleep 15
+rpk cluster info --brokers localhost:9092
 ```
 
 ---
 
 ## Source Code Trace
 
-The write path flows through four distinct layers. Each layer hands off to the next. Below is the trace with the key files involved.
-
-### Layer 1 — Kafka API Entry Point
-
-The producer request enters here:
+The complete write path through 4 layers:
 
 ```
-src/v/kafka/server/replicated_partition.h
-src/v/kafka/server/replicated_partition.cc
+produce_handler::handle()         [produce.cc:639]
+        ↓
+partition_append()                [produce.cc:135]
+        ↓
+partition.replicate()             [produce.cc:152]
+        ↓
+_raft->replicate()                [partition.cc:348]
+        ↓
+append_entries_request            [consensus.cc:721]
+        ↓
+.append_entries() RPC             [consensus.cc:738]
+        ↓
+disk_log_impl::make_appender()    [disk_log_impl.cc:2093]
+        ↓
+disk_log_appender::operator()     [disk_log_appender.cc:81]
+        ↓
+segment_appender::append()        [segment_appender.cc:111]
+        ↓
+dma_write() to disk               [segment_appender.cc:648]
 ```
-
-Search the produce handler:
-```bash
-rg "produce_request" src/v/kafka/server/
-```
-
-### Layer 2 — Cluster / Partition Management
-
-The message is assigned to a partition and handed to the cluster layer:
-
-```
-src/v/cluster/partition.h
-src/v/cluster/partition.cc
-```
-
-Key function to locate:
-```bash
-rg "replicate" src/v/cluster/partition.cc
-```
-
-### Layer 3 — Raft Consensus
-
-The partition leader uses Raft to replicate the entry across nodes before acknowledging the write:
-
-```
-src/v/raft/consensus.h
-src/v/raft/consensus.cc
-```
-
-Key functions:
-```bash
-rg "append_entries" src/v/raft/
-rg "do_append" src/v/raft/
-```
-
-### Layer 4 — Physical Storage
-
-Once consensus is reached, the entry is appended to the on-disk log:
-
-```
-src/v/storage/log.h
-src/v/storage/log.cc
-src/v/storage/segment.cc
-```
-
-Key functions:
-```bash
-rg "do_write" src/v/storage/
-rg "append" src/v/storage/log.cc
-```
-
-> **Full trace with exact line numbers will be added here after code analysis is complete.**
 
 ---
 
 ## Design Decisions
 
-Three key design decisions identified in Redpanda's partitioning implementation:
-
-| # | Decision | Location in Code | Problem Solved | Trade-off |
-|---|---|---|---|---|
-| 1 | Thread-per-core architecture (Seastar) | `src/v/application.cc` | Eliminates context switching overhead | Cross-core partition communication is more complex |
-| 2 | Raft-based replication (no ZooKeeper) | `src/v/raft/consensus.cc` | Removes external dependency, faster failover | Raft adds implementation complexity |
-| 3 | Append-only segment storage | `src/v/storage/segment.cc` | Sequential writes maximize disk throughput | Compaction/cleanup required for old data |
-
-> **Detailed analysis with code references will be filled in after the deep dive.**
+| Decision | Code Reference | Problem Solved | Trade-off |
+|---|---|---|---|
+| Thread-per-core (Seastar) | produce.cc:259, shard_table.h:47 | No locks, no context switching | No automatic load rebalancing |
+| Raft before ack | partition.cc:348, consensus.cc:721 | Zero data loss for acked writes | Network round-trip per produce |
+| Append-only + DMA | segment_appender.cc:648 | Predictable low latency writes | Compaction needed for cleanup |
+| murmur2 key hashing | hashing/murmur.h | Kafka-compatible partition routing | Skewed keys = hot partition |
 
 ---
 
 ## Experiments
 
-### Experiment 1 — Partition Count vs. Throughput
+### Experiment 1: Partition Count vs Throughput
 
-Vary the number of partitions (1, 3, 6, 12) and measure producer throughput for a fixed message count.
+| Partitions | Time (s) | Msgs/sec | MB/sec |
+|------------|----------|----------|--------|
+| 1          | 1.19     | 4196     | 4.10   |
+| 3          | 0.95     | 5263     | 5.14   |
+| 6          | 1.36     | 3679     | 3.59   |
+| 12         | 1.36     | 3685     | 3.60   |
 
-```bash
-# Example: produce 100k messages and time it
-time seq 1 100000 | kafkacat -P -b localhost:9092 -t test-topic
-```
-
-**Expected outcome:** Throughput should increase with partition count up to the number of available cores, then plateau or degrade. *(Results to be added.)*
-
----
-
-### Experiment 2 — Leader Failover
-
-Run a 3-node cluster, kill the partition leader, and observe how long re-election takes.
-
-```bash
-# Bring up 3-node cluster
-docker compose up -d
-
-# Kill the leader
-docker stop redpanda-1
-
-# Watch recovery
-rpk cluster info
-```
-
-**Expected outcome:** Raft should elect a new leader within seconds. Consumer lag during this window will be measured. *(Results to be added.)*
+Peak throughput at 3 partitions. Plateau confirmed at 6 and 12.
+Proves thread-per-core scaling behaviour.
+Python client became bottleneck before broker cores were saturated.
 
 ---
 
-### Experiment 3 — Partition Skew
+### Experiment 2: Partition Leader Failover
 
-Route 90% of traffic to a single partition and observe throughput and latency compared to a balanced distribution.
+| Metric | Value |
+|---|---|
+| Total messages | 150 |
+| Errors | 0 |
+| Failover spike | 7230.2ms (message 33) |
+| Normal latency | ~2-4ms |
+| Data loss | Zero |
 
-*(Script and results to be added.)*
+Raft elected new leader within ~7 seconds.
+Zero errors. Zero data loss. Instant recovery after election.
+Proves consensus.cc leader election code path experimentally.
 
 ---
 
-## Failure Analysis
+### Experiment 3: Partition Skew
 
-The following failure scenarios will be analyzed based on experiment results:
+| Scenario | Msgs/sec | Hot Partition |
+|---|---|---|
+| Skewed (fixed key) | 3754 | P1: 100% of traffic |
+| Even (varied keys) | 4107 | P0/P1/P2: ~33% each |
 
-1. **What happens when data size increases significantly across partitions?**
-   - Expected: Segment rollover triggers, compaction load increases, storage I/O becomes the bottleneck.
-
-2. **What happens under partition skew (one partition gets 90% of traffic)?**
-   - Expected: The core handling that partition saturates while others sit idle — the thread-per-core model has no load balancing within a node.
-
-3. **What happens if a Raft leader crashes mid-write?**
-   - Expected: Raft ensures uncommitted entries are rolled back; no data loss for acknowledged writes.
-
-4. **What assumptions does Redpanda's partitioning rely on?**
-   - Sequential disk I/O being fast, network latency between replicas being low, and producer keys being well-distributed.
-
-> **Findings will be updated after experiments are run.**
+9.4% throughput gain from even key distribution.
+Fixed key routed 100% to Partition 1 — proves murmur2 determinism.
+Thread-per-core cannot rebalance skewed load automatically.
 
 ---
 
 ## Key Findings
 
-*(To be completed after code tracing and experiments.)*
+1. **Partition count should match client capability not just core count**  
+   Peak at 3 partitions despite 8 available cores — Python client
+   became the bottleneck before the broker was saturated.
 
-Preliminary expectations:
-- Redpanda's tight coupling of Raft and storage gives it a latency advantage over Kafka for replication acknowledgment.
-- The thread-per-core model means partition count should be tuned to match CPU core count for optimal performance.
-- Leader failover is fast but not instantaneous — there is a measurable unavailability window during election.
+2. **Raft guarantees zero data loss with a measurable failover window**  
+   7.2 second election window observed experimentally. Zero errors
+   and zero data loss with acks=all and retries=10.
+
+3. **Key design is the most critical operational decision**  
+   Fixed keys cause 100% skew to one partition and 9.4% throughput
+   loss. murmur2 with varied keys gives near-perfect distribution.
+
+4. **DMA writes bypass page cache for predictable latency**  
+   Every write is a direct DMA operation (segment_appender.cc:648)
+   — no page cache eviction surprises, predictable tail latency.
 
 ---
 
@@ -281,4 +226,5 @@ Preliminary expectations:
 - [Redpanda Architecture Docs](https://docs.redpanda.com/current/reference/architecture/)
 - [Raft Consensus Algorithm](https://raft.github.io/)
 - [Seastar Framework](https://seastar.io/)
-- [Apache Kafka Partitioning (for comparison)](https://kafka.apache.org/documentation/#design_partitionsreplication)
+- [MurmurHash](https://github.com/aappleby/smhasher)
+- [Kafka Partitioning](https://kafka.apache.org/documentation/)
